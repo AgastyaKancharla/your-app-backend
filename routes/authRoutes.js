@@ -73,7 +73,7 @@ const ALLOW_INSECURE_PASSWORD_RESET =
 const ALLOW_DECODED_GOOGLE_LOGIN =
   !IS_PRODUCTION && parseBoolean(process.env.AUTH_ALLOW_DECODED_GOOGLE_LOGIN, false);
 const LOCAL_REFRESH_VERSIONS = new Map();
-const GENERIC_AUTH_FAILURE_MESSAGE = "Invalid email or password";
+const GENERIC_AUTH_FAILURE_MESSAGE = "Invalid credentials";
 const GENERIC_RESEND_VERIFICATION_MESSAGE =
   "If the account exists and still needs verification, a new code will be sent shortly.";
 const GENERIC_RECOVERY_IDENTIFIER_ERROR =
@@ -132,6 +132,12 @@ const sendAuthRouteError = (res, err, fallbackMessage = "Internal server error")
 
   return res.serverError(err, { fallbackMessage });
 };
+
+const sendLoginFailure = (res, status = 401, message = GENERIC_AUTH_FAILURE_MESSAGE) =>
+  res.status(status).json({
+    success: false,
+    message
+  });
 
 router.use((req, res, next) => {
   if (!allowLocalAuthFallback() && !isDbConnected()) {
@@ -444,6 +450,7 @@ const buildAuthPayload = (user, authContext, tokens = issueAuthTokens(user, auth
   };
 
   return {
+    success: true,
     expiresIn: ACCESS_TOKEN_EXPIRY,
     role: activeRole,
     roles: authContext?.roles || [],
@@ -2122,22 +2129,22 @@ router.post("/login", loginRateLimit, async (req, res) => {
     const normalizedEmail = normalizeEmail(email);
 
     if (!normalizedEmail || !password) {
-      return res.status(400).json({ message: "Email and password are required" });
+      return sendLoginFailure(res, 400);
     }
 
     if (isDbConnected()) {
       const user = await User.findOne({ email: normalizedEmail, isActive: true });
       if (!user) {
-        return res.status(401).json({ message: GENERIC_AUTH_FAILURE_MESSAGE });
+        return sendLoginFailure(res);
       }
 
       if (!user.passwordHash) {
-        return res.status(401).json({ message: GENERIC_AUTH_FAILURE_MESSAGE });
+        return sendLoginFailure(res);
       }
 
       const match = await bcrypt.compare(password, user.passwordHash);
       if (!match) {
-        return res.status(401).json({ message: GENERIC_AUTH_FAILURE_MESSAGE });
+        return sendLoginFailure(res);
       }
 
       if (isVerificationPending(user)) {
@@ -2163,16 +2170,16 @@ router.post("/login", loginRateLimit, async (req, res) => {
     let localUser = findLocalUserByEmail(normalizedEmail, { activeOnly: true });
 
     if (!localUser) {
-      return res.status(401).json({ message: GENERIC_AUTH_FAILURE_MESSAGE });
+      return sendLoginFailure(res);
     }
 
     if (!localUser.passwordHash) {
-      return res.status(401).json({ message: GENERIC_AUTH_FAILURE_MESSAGE });
+      return sendLoginFailure(res);
     }
 
     const match = await bcrypt.compare(password, localUser.passwordHash);
     if (!match) {
-      return res.status(401).json({ message: GENERIC_AUTH_FAILURE_MESSAGE });
+      return sendLoginFailure(res);
     }
 
     if (isVerificationPending(localUser)) {

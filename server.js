@@ -70,6 +70,7 @@ const configuredOrigins = String(process.env.CORS_ORIGIN || "")
   .split(",")
   .map((origin) => origin.trim())
   .filter(Boolean);
+const productionFrontendOrigins = ["https://wevalue.in", "https://www.wevalue.in"];
 const appOrigin = (() => {
   try {
     return process.env.APP_BASE_URL ? new URL(process.env.APP_BASE_URL).origin : "";
@@ -77,7 +78,9 @@ const appOrigin = (() => {
     return "";
   }
 })();
-const allowedOrigins = Array.from(new Set([...configuredOrigins, appOrigin].filter(Boolean)));
+const allowedOrigins = Array.from(
+  new Set([...productionFrontendOrigins, ...configuredOrigins, appOrigin].filter(Boolean))
+);
 const ordersIo = new Server(httpServer, {
   cors: {
     origin: true,

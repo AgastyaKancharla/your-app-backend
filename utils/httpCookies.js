@@ -56,14 +56,14 @@ const parseDurationToMs = (value, fallbackMs = 0) => {
 };
 
 const getCookieSettings = () => {
-  const secure = parseBoolean(process.env.AUTH_COOKIE_SECURE, isProduction());
+  const secure = parseBoolean(process.env.AUTH_COOKIE_SECURE, true);
   const sameSite = normalizeSameSite(
     process.env.AUTH_COOKIE_SAME_SITE,
-    secure ? "none" : "lax"
+    "none"
   );
 
   return {
-    accessCookieName: String(process.env.AUTH_ACCESS_COOKIE_NAME || "wevalue_access").trim(),
+    accessCookieName: String(process.env.AUTH_ACCESS_COOKIE_NAME || "token").trim(),
     refreshCookieName: String(process.env.AUTH_REFRESH_COOKIE_NAME || "wevalue_refresh").trim(),
     domain: String(process.env.AUTH_COOKIE_DOMAIN || "").trim(),
     path: String(process.env.AUTH_COOKIE_PATH || "/").trim() || "/",
