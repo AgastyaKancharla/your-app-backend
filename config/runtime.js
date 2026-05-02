@@ -72,10 +72,7 @@ const hasAnyStripeConfig = () => {
   return Boolean(
     String(process.env.STRIPE_SECRET_KEY || "").trim() ||
       String(process.env.STRIPE_WEBHOOK_SECRET || "").trim() ||
-      getConfiguredStripePlans().length ||
-      String(process.env.STRIPE_CHECKOUT_SUCCESS_URL || "").trim() ||
-      String(process.env.STRIPE_CHECKOUT_CANCEL_URL || "").trim() ||
-      String(process.env.STRIPE_PORTAL_RETURN_URL || "").trim()
+      getConfiguredStripePlans().length
   );
 };
 
