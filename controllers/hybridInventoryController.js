@@ -25,11 +25,15 @@ const {
 const { getStockSummary } = require("../services/inventoryMovementService");
 const { assertCloudKitchenWorkspace } = require("../utils/cloudKitchenWorkspace");
 const { getTenantRestaurantId, withTenantFilter } = require("../utils/tenantScope");
+const { normalizeUnit } = require("../utils/unitConversion");
 
 const toNumber = (value, fallback = 0) => {
   const parsed = Number(value);
   return Number.isFinite(parsed) ? parsed : fallback;
 };
+
+const getStockValueQuantity = (quantity, unit) =>
+  normalizeUnit(unit) === "grm" ? toNumber(quantity) / 1000 : toNumber(quantity);
 
 const assertCloud = async (req) => {
   await assertCloudKitchenWorkspace(req);
@@ -362,7 +366,7 @@ const stockAnalytics = async (req, res) => {
       getInventorySettings(restaurantId)
     ]);
     const rawValue = rawMaterials.reduce(
-      (sum, item) => sum + toNumber(item.quantity) * toNumber(item.costPerUnit ?? item.pricePerUnit),
+      (sum, item) => sum + getStockValueQuantity(item.quantity, item.unit) * toNumber(item.costPerUnit ?? item.pricePerUnit),
       0
     );
     const prepValue = prepItems.reduce((sum, item) => sum + toNumber(item.cost), 0);

@@ -1,4 +1,5 @@
 const mongoose = require("mongoose");
+const { normalizeUnit } = require("../utils/unitConversion");
 
 const ingredientSchema = new mongoose.Schema({
   restaurantId: {
@@ -131,6 +132,8 @@ ingredientSchema.pre("validate", function syncInventoryAliases(next) {
   this.costPerUnit = Number.isFinite(unitCost) ? Math.max(0, unitCost) : 0;
   this.pricePerUnit = this.costPerUnit;
   this.purchasePrice = this.costPerUnit;
+  this.unit = normalizeUnit(this.unit || "kg") || "kg";
+  this.minStockUnit = normalizeUnit(this.minStockUnit || this.unit) || this.unit;
   this.category = String(this.category || "General").trim() || "General";
 
   next();

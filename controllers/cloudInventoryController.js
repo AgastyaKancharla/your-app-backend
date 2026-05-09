@@ -32,6 +32,17 @@ const toNumber = (value, fallback = 0) => {
   return Number.isFinite(parsed) ? parsed : fallback;
 };
 
+const getStockValueQuantity = (quantity, unit) => {
+  const normalizedUnit = normalizeUnit(unit);
+  if (normalizedUnit === "grm") {
+    return toNumber(quantity) / 1000;
+  }
+  return toNumber(quantity);
+};
+
+const calculateStockValue = (quantity, unit, costPerUnit) =>
+  Number((getStockValueQuantity(quantity, unit) * toNumber(costPerUnit)).toFixed(2));
+
 const cleanText = (value = "") => String(value || "").trim();
 const escapeRegex = (value = "") => value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 
@@ -190,6 +201,7 @@ const normalizeRawPayload = (body = {}) => {
 const serializeRawMaterial = (item, supplierMap = new Map()) => {
   const plain = item && typeof item.toObject === "function" ? item.toObject() : { ...(item || {}) };
   const supplier = plain.supplierId ? supplierMap.get(String(plain.supplierId)) : null;
+  const unit = normalizeUnit(plain.unit || "kg") || "kg";
   const currentStock = toNumber(plain.quantity ?? plain.currentStock);
   const minStock = toNumber(plain.minStock ?? plain.minStockAlert);
   const costPerUnit = toNumber(plain.costPerUnit ?? plain.pricePerUnit);
@@ -199,7 +211,7 @@ const serializeRawMaterial = (item, supplierMap = new Map()) => {
     name: plain.name || plain.itemName || "",
     image: plain.image || "",
     category: plain.category || "General",
-    unit: plain.unit || "kg",
+    unit,
     currentStock,
     quantity: currentStock,
     minStock,
@@ -208,7 +220,7 @@ const serializeRawMaterial = (item, supplierMap = new Map()) => {
     supplierId: plain.supplierId || null,
     supplierName: supplier?.name || plain.supplier || plain.vendorName || "",
     expiryDate: plain.expiryDate || null,
-    stockValue: Number((currentStock * costPerUnit).toFixed(2)),
+    stockValue: calculateStockValue(currentStock, unit, costPerUnit),
     status: getStockStatus({ currentStock, minStock }),
     expiryStatus: getExpiryStatus(plain.expiryDate),
     createdAt: plain.createdAt
