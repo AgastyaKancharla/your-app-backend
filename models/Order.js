@@ -89,6 +89,53 @@ const OrderSchema = new mongoose.Schema({
       price: {
         type: Number,
         required: true
+      },
+      recipeVersionId: {
+        type: mongoose.Schema.Types.ObjectId,
+        ref: "RecipeVersion",
+        default: null
+      },
+      costSnapshot: {
+        recipeCost: {
+          type: Number,
+          default: 0
+        },
+        unitCost: {
+          type: Number,
+          default: 0
+        },
+        totalCost: {
+          type: Number,
+          default: 0
+        },
+        ingredients: [
+          {
+            ingredientId: {
+              type: mongoose.Schema.Types.ObjectId,
+              default: null
+            },
+            ingredientType: {
+              type: String,
+              default: ""
+            },
+            quantity: {
+              type: Number,
+              default: 0
+            },
+            unit: {
+              type: String,
+              default: ""
+            },
+            costPerUnit: {
+              type: Number,
+              default: 0
+            },
+            totalCost: {
+              type: Number,
+              default: 0
+            }
+          }
+        ]
       }
     }
   ],
@@ -248,6 +295,26 @@ const OrderSchema = new mongoose.Schema({
   platform: {
     type: String,
     default: "MANUAL"
+  },
+  inventoryOverride: {
+    reason: {
+      type: String,
+      default: "",
+      trim: true
+    },
+    userId: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "User",
+      default: null
+    },
+    timestamp: {
+      type: Date,
+      default: null
+    },
+    shortages: {
+      type: [mongoose.Schema.Types.Mixed],
+      default: []
+    }
   },
   expectedPrepTimeMinutes: {
     type: Number,

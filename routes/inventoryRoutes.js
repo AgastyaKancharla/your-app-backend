@@ -7,14 +7,18 @@ const path = require("path");
 const Ingredient = require("../models/Ingredient");
 const Recipe = require("../models/Recipe");
 const Order = require("../models/Order");
-const WastageLog = require("../models/WastageLog");
 const cloudInventoryController = require("../controllers/cloudInventoryController");
+const hybridInventoryController = require("../controllers/hybridInventoryController");
 const requirePermission = require("../middleware/requirePermission");
 const { requirePlanFeature } = require("../middleware/planLimitMiddleware");
 const {
   deductInventoryForItems,
   syncMenuAvailability
 } = require("../services/cloudKitchenOperationsService");
+const {
+  createInventoryMovement,
+  runInInventoryTransaction
+} = require("../services/inventoryMovementService");
 const { getQuantityPerPack } = require("../utils/recipeQuantities");
 const {
   getTenantRestaurantId,
@@ -144,41 +148,65 @@ const runBulkIngredientImport = async ({ rows, req, restaurantId }) => {
     throw error;
   }
 
-  const operations = rows.map((row) => ({
-    updateOne: {
-      filter: {
-        restaurantId,
-        name: row.name
-      },
-      update: {
-        $setOnInsert: {
-          restaurantId,
-          name: row.name
-        },
-        $set: {
-          unit: row.unit,
-          minStock: row.minStock,
-          minStockUnit: row.minStockUnit || row.unit,
-          pricePerUnit: row.pricePerUnit,
-          stockCategory: row.stockCategory,
-          minStockAlert: row.minStock,
-          purchasePrice: row.purchasePrice,
-          supplier: row.supplier || row.vendorName,
-          purchaseDate: row.purchaseDate,
-          expiryDate: row.expiryDate,
-          vendorName: row.vendorName,
-          vendorPhone: row.vendorPhone
-        },
-        $inc: {
-          quantity: row.quantity,
-          currentStock: row.quantity
-        }
-      },
-      upsert: true
-    }
-  }));
+  await runInInventoryTransaction(async (session) => {
+    for (const row of rows) {
+      let ingredient = await Ingredient.findOne({ restaurantId, name: row.name }).session(session);
+      if (!ingredient) {
+        const created = await Ingredient.create(
+          [
+            {
+              restaurantId,
+              ...row,
+              quantity: 0,
+              currentStock: 0,
+              stock: 0,
+              minStockAlert: row.minStock,
+              purchasePrice: row.purchasePrice,
+              lowStockAlert: isBelowMinStock({
+                quantity: 0,
+                unit: row.unit,
+                minStock: row.minStock,
+                minStockUnit: row.minStockUnit
+              })
+            }
+          ],
+          { session }
+        );
+        ingredient = created[0];
+      } else {
+        ingredient.unit = row.unit;
+        ingredient.minStock = row.minStock;
+        ingredient.minStockUnit = row.minStockUnit || row.unit;
+        ingredient.pricePerUnit = row.pricePerUnit;
+        ingredient.costPerUnit = row.pricePerUnit;
+        ingredient.stockCategory = row.stockCategory;
+        ingredient.minStockAlert = row.minStock;
+        ingredient.purchasePrice = row.purchasePrice;
+        ingredient.supplier = row.supplier || row.vendorName;
+        ingredient.purchaseDate = row.purchaseDate;
+        ingredient.expiryDate = row.expiryDate;
+        ingredient.vendorName = row.vendorName;
+        ingredient.vendorPhone = row.vendorPhone;
+        await ingredient.save({ session });
+      }
 
-  await Ingredient.bulkWrite(operations, { ordered: false });
+      if (row.quantity > 0) {
+        await createInventoryMovement({
+          restaurantId,
+          itemId: ingredient._id,
+          itemType: "raw_material",
+          movementType: "purchase",
+          quantity: row.quantity,
+          unit: row.unit,
+          costPerUnit: row.pricePerUnit,
+          referenceType: "adjustment",
+          createdBy: req.user?.userId || null,
+          notes: "Bulk inventory import",
+          session
+        });
+      }
+    }
+  });
   await syncLowStockAlerts(withTenantFilter(req));
   await maybeSyncCloudKitchenAvailability(req);
 
@@ -277,6 +305,77 @@ router.patch(
   cloudInventoryController.updatePurchaseOrderStatus
 );
 
+router.post(
+  "/purchase-orders/:id/receive",
+  requirePermission("inventory.update"),
+  hybridInventoryController.receivePO
+);
+
+router.get(
+  "/movements/summary",
+  requirePermission("inventory.view"),
+  hybridInventoryController.getMovementSummary
+);
+
+router.get(
+  "/movements",
+  requirePermission("inventory.view"),
+  hybridInventoryController.getMovements
+);
+
+router.post(
+  "/adjustments",
+  requirePermission("inventory.update"),
+  hybridInventoryController.createAdjustment
+);
+
+router.post(
+  "/prep/produce",
+  requirePermission("inventory.create"),
+  hybridInventoryController.createPrepProduction
+);
+
+router
+  .route("/reconciliations")
+  .get(requirePermission("inventory.view"), hybridInventoryController.listReconciliations)
+  .post(requirePermission("inventory.create"), hybridInventoryController.createReconciliation);
+
+router.patch(
+  "/reconciliations/:id/approve",
+  requirePermission("inventory.update"),
+  hybridInventoryController.approveReconciliationRequest
+);
+
+router.patch(
+  "/reconciliations/:id/reject",
+  requirePermission("inventory.update"),
+  hybridInventoryController.rejectReconciliation
+);
+
+router.get(
+  "/analytics/stock",
+  requirePermission("inventory.view"),
+  hybridInventoryController.stockAnalytics
+);
+
+router.patch(
+  "/settings",
+  requirePermission("inventory.update"),
+  hybridInventoryController.updateInventorySettings
+);
+
+router.get(
+  "/purchase-suggestions",
+  requirePermission("inventory.view"),
+  hybridInventoryController.purchaseSuggestions
+);
+
+router.get(
+  "/supplier-price-history",
+  requirePermission("inventory.view"),
+  hybridInventoryController.priceHistory
+);
+
 // =============================
 // ADD Ingredient
 // =============================
@@ -293,57 +392,73 @@ router.post("/", requirePermission("inventory.create"), async (req, res) => {
       return res.status(400).json({ message: "Quantity must be greater than zero" });
     }
 
-    const existing = await Ingredient.findOne(
-      withTenantFilter(req, {
-        name: {
-          $regex: new RegExp(`^${escapeRegex(payload.name)}$`, "i")
-        }
-      })
-    );
+    let result;
+    await runInInventoryTransaction(async (session) => {
+      let ingredient = await Ingredient.findOne(
+        withTenantFilter(req, {
+          name: {
+            $regex: new RegExp(`^${escapeRegex(payload.name)}$`, "i")
+          }
+        })
+      ).session(session);
 
-    if (existing) {
-      existing.quantity = Number(existing.quantity || 0) + payload.quantity;
-      existing.unit = payload.unit;
-      existing.minStock = payload.minStock;
-      existing.minStockUnit = payload.minStockUnit || payload.unit;
-      existing.pricePerUnit = payload.pricePerUnit;
-      existing.stockCategory = payload.stockCategory;
-      existing.currentStock = existing.quantity;
-      existing.minStockAlert = existing.minStock;
-      existing.purchasePrice = payload.purchasePrice;
-      existing.supplier = payload.supplier;
-      existing.purchaseDate = payload.purchaseDate;
-      existing.expiryDate = payload.expiryDate;
-      existing.vendorName = payload.vendorName;
-      existing.vendorPhone = payload.vendorPhone;
-      existing.lowStockAlert = isBelowMinStock({
-        quantity: existing.quantity,
-        unit: existing.unit,
-        minStock: existing.minStock,
-        minStockUnit: existing.minStockUnit
-      });
-      await existing.save();
-      await maybeSyncCloudKitchenAvailability(req);
+      if (!ingredient) {
+        const created = await Ingredient.create(
+          [
+            {
+              restaurantId,
+              ...payload,
+              quantity: 0,
+              currentStock: 0,
+              stock: 0,
+              minStockAlert: payload.minStock,
+              purchasePrice: payload.purchasePrice,
+              lowStockAlert: isBelowMinStock({
+                quantity: 0,
+                unit: payload.unit,
+                minStock: payload.minStock,
+                minStockUnit: payload.minStockUnit
+              })
+            }
+          ],
+          { session }
+        );
+        ingredient = created[0];
+      } else {
+        ingredient.unit = payload.unit;
+        ingredient.minStock = payload.minStock;
+        ingredient.minStockUnit = payload.minStockUnit || payload.unit;
+        ingredient.pricePerUnit = payload.pricePerUnit;
+        ingredient.costPerUnit = payload.pricePerUnit;
+        ingredient.stockCategory = payload.stockCategory;
+        ingredient.minStockAlert = payload.minStock;
+        ingredient.purchasePrice = payload.purchasePrice;
+        ingredient.supplier = payload.supplier;
+        ingredient.purchaseDate = payload.purchaseDate;
+        ingredient.expiryDate = payload.expiryDate;
+        ingredient.vendorName = payload.vendorName;
+        ingredient.vendorPhone = payload.vendorPhone;
+        await ingredient.save({ session });
+      }
 
-      return res.json(existing);
-    }
-
-    const ingredient = await Ingredient.create({
-      restaurantId,
-      ...payload,
-      currentStock: payload.quantity,
-      minStockAlert: payload.minStock,
-      purchasePrice: payload.purchasePrice,
-      lowStockAlert: isBelowMinStock({
+      const movementResult = await createInventoryMovement({
+        restaurantId,
+        itemId: ingredient._id,
+        itemType: "raw_material",
+        movementType: "purchase",
         quantity: payload.quantity,
         unit: payload.unit,
-        minStock: payload.minStock,
-        minStockUnit: payload.minStockUnit
-      })
+        costPerUnit: payload.pricePerUnit,
+        referenceType: "adjustment",
+        createdBy: req.user?.userId || null,
+        notes: "Inventory stock-in",
+        session
+      });
+      result = movementResult.item;
     });
 
     await maybeSyncCloudKitchenAvailability(req);
-    res.status(201).json(ingredient);
+    res.status(201).json(result);
   } catch (err) {
     return res.serverError(err);
   }
@@ -399,73 +514,6 @@ router.post(
       return res.json({
         message: "Inventory deducted successfully",
         ...result
-      });
-    } catch (err) {
-      if (err.status) {
-        return res.status(err.status).json({ message: err.message });
-      }
-      return res.serverError(err);
-    }
-  }
-);
-
-router.post(
-  "/wastage",
-  requirePermission("inventory.create"),
-  async (req, res) => {
-    try {
-      await assertCloudKitchenWorkspace(req);
-
-      const ingredientId = String(req.body?.ingredientId || "").trim();
-      const quantity = Math.max(0, toNumber(req.body?.quantity));
-      const reason = String(req.body?.reason || "").trim();
-
-      if (!ingredientId) {
-        return res.status(400).json({ message: "ingredientId is required" });
-      }
-
-      if (quantity <= 0) {
-        return res.status(400).json({ message: "Wastage quantity must be greater than zero" });
-      }
-
-      const ingredient = await Ingredient.findOne(withTenantDocFilter(req, ingredientId));
-      if (!ingredient) {
-        return res.status(404).json({ message: "Ingredient not found" });
-      }
-
-      if (toNumber(ingredient.quantity) < quantity) {
-        return res.status(409).json({
-          message: `Insufficient stock for ${ingredient.name}. Available ${toNumber(
-            ingredient.quantity
-          )} ${ingredient.unit || "units"}.`
-        });
-      }
-
-      ingredient.quantity = Number((toNumber(ingredient.quantity) - quantity).toFixed(4));
-      ingredient.currentStock = ingredient.quantity;
-      ingredient.lowStockAlert = isBelowMinStock({
-        quantity: ingredient.quantity,
-        unit: ingredient.unit,
-        minStock: ingredient.minStock,
-        minStockUnit: ingredient.minStockUnit
-      });
-      await ingredient.save();
-      await maybeSyncCloudKitchenAvailability(req);
-
-      const log = await WastageLog.create({
-        restaurantId: getTenantRestaurantId(req),
-        ingredientId: ingredient._id,
-        ingredientName: ingredient.name,
-        quantity,
-        unit: ingredient.unit || "kg",
-        reason,
-        estimatedCost: Number((quantity * toNumber(ingredient.pricePerUnit)).toFixed(2)),
-        createdBy: req.user?.userId || null
-      });
-
-      return res.status(201).json({
-        log,
-        ingredient: applyStockAliases(ingredient.toObject())
       });
     } catch (err) {
       if (err.status) {
@@ -633,27 +681,53 @@ router.put("/:id", requirePermission("inventory.update"), async (req, res) => {
       return res.status(400).json({ message: "Ingredient name is required" });
     }
 
-    const updatedIngredient = await Ingredient.findOneAndUpdate(
-      withTenantDocFilter(req, req.params.id),
-      {
-        ...payload,
-        currentStock: payload.quantity,
-        minStockAlert: payload.minStock,
-        purchasePrice: payload.purchasePrice,
-        supplier: payload.supplier,
-        stockCategory: payload.stockCategory,
-        lowStockAlert: isBelowMinStock({
-          quantity: payload.quantity,
-          unit: payload.unit,
-          minStock: payload.minStock,
-          minStockUnit: payload.minStockUnit
-        })
-      },
-      {
-        new: true,
-        runValidators: true
+    const restaurantId = getTenantRestaurantId(req);
+    let updatedIngredient;
+    await runInInventoryTransaction(async (session) => {
+      const existing = await Ingredient.findOne(withTenantDocFilter(req, req.params.id)).session(session);
+
+      if (!existing) {
+        return;
       }
-    );
+
+      const stockDelta = Number((payload.quantity - toNumber(existing.quantity)).toFixed(4));
+      existing.name = payload.name;
+      existing.itemName = payload.itemName || payload.name;
+      existing.unit = payload.unit;
+      existing.minStock = payload.minStock;
+      existing.minStockUnit = payload.minStockUnit;
+      existing.pricePerUnit = payload.pricePerUnit;
+      existing.costPerUnit = payload.pricePerUnit;
+      existing.minStockAlert = payload.minStock;
+      existing.purchasePrice = payload.purchasePrice;
+      existing.supplier = payload.supplier;
+      existing.stockCategory = payload.stockCategory;
+      existing.purchaseDate = payload.purchaseDate;
+      existing.expiryDate = payload.expiryDate;
+      existing.vendorName = payload.vendorName;
+      existing.vendorPhone = payload.vendorPhone;
+      await existing.save({ session });
+
+      if (stockDelta) {
+        const movementResult = await createInventoryMovement({
+          restaurantId,
+          itemId: existing._id,
+          itemType: "raw_material",
+          movementType: "adjustment",
+          quantity: stockDelta,
+          unit: payload.unit,
+          costPerUnit: payload.pricePerUnit,
+          referenceType: "adjustment",
+          createdBy: req.user?.userId || null,
+          notes: "Inventory stock edit",
+          allowNegativeStock: true,
+          session
+        });
+        updatedIngredient = movementResult.item;
+      } else {
+        updatedIngredient = existing;
+      }
+    });
 
     if (!updatedIngredient) {
       return res.status(404).json({ message: "Ingredient not found" });

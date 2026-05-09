@@ -1,6 +1,7 @@
 const express = require("express");
 const Recipe = require("../models/Recipe");
 const MenuItem = require("../models/MenuItem");
+const hybridInventoryController = require("../controllers/hybridInventoryController");
 const authorizeRoles = require("../middleware/authorizeRoles");
 const { requirePlanFeature } = require("../middleware/planLimitMiddleware");
 const { syncMenuAvailability } = require("../services/cloudKitchenOperationsService");
@@ -43,6 +44,28 @@ router.get("/", authorizeRoles(RECIPE_MANAGEMENT_ROLES), async (req, res) => {
     return res.serverError(err);
   }
 });
+
+router.get("/versions", authorizeRoles(RECIPE_MANAGEMENT_ROLES), hybridInventoryController.listRecipeVersions);
+
+router.post("/versions", authorizeRoles(RECIPE_MANAGEMENT_ROLES), hybridInventoryController.createRecipe);
+
+router.post(
+  "/versions/new",
+  authorizeRoles(RECIPE_MANAGEMENT_ROLES),
+  hybridInventoryController.versionRecipe
+);
+
+router.get(
+  "/versions/:versionId/costing",
+  authorizeRoles(RECIPE_MANAGEMENT_ROLES),
+  hybridInventoryController.getRecipeCosting
+);
+
+router.get(
+  "/usage",
+  authorizeRoles(RECIPE_MANAGEMENT_ROLES),
+  hybridInventoryController.getRecipeUsage
+);
 
 router.post("/", authorizeRoles(RECIPE_MANAGEMENT_ROLES), async (req, res) => {
   try {

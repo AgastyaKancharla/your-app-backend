@@ -30,6 +30,39 @@ const whatsappIntegrationSchema = new mongoose.Schema(
   { _id: false }
 );
 
+const inventorySettingsSchema = new mongoose.Schema(
+  {
+    mode: {
+      type: String,
+      enum: ["STRICT", "WARNING", "MANUAL"],
+      default: "STRICT"
+    },
+    allowNegativeStock: {
+      type: Boolean,
+      default: false
+    },
+    requireOverrideReason: {
+      type: Boolean,
+      default: true
+    },
+    blockCriticalIngredientOnly: {
+      type: Boolean,
+      default: true
+    },
+    leadTimeDays: {
+      type: Number,
+      default: 2,
+      min: 0
+    },
+    safetyDays: {
+      type: Number,
+      default: 2,
+      min: 0
+    }
+  },
+  { _id: false }
+);
+
 const restaurantSchema = new mongoose.Schema(
   {
     name: { type: String, required: true, trim: true },
@@ -87,6 +120,10 @@ const restaurantSchema = new mongoose.Schema(
     },
     whatsapp: {
       type: whatsappIntegrationSchema,
+      default: () => ({})
+    },
+    inventorySettings: {
+      type: inventorySettingsSchema,
       default: () => ({})
     },
     city: { type: String, default: "", trim: true },

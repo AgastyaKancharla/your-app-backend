@@ -2,7 +2,7 @@ const express = require("express");
 
 const PurchaseOrder = require("../models/PurchaseOrder");
 const Supplier = require("../models/Supplier");
-const Ingredient = require("../models/Ingredient");
+const { receivePurchaseOrder } = require("../services/hybridInventoryService");
 const authorizeRoles = require("../middleware/authorizeRoles");
 const { requirePlanFeature } = require("../middleware/planLimitMiddleware");
 const { PURCHASE_ORDER_ROLES } = require("../utils/accessControl");
@@ -184,39 +184,14 @@ router.put("/:id/status", authorizeRoles(PURCHASE_ORDER_ROLES), async (req, res)
     purchaseOrder.status = nextStatus;
     if (nextStatus === "RECEIVED") {
       const restaurantId = getTenantRestaurantId(req);
-      purchaseOrder.receivedAt = new Date();
-
-      for (const line of purchaseOrder.lines) {
-        const ingredientName = normalizeText(line.ingredientName);
-        if (!ingredientName) {
-          continue;
-        }
-
-        const quantity = Math.max(0, toNumber(line.quantity));
-        const unitPrice = Math.max(0, toNumber(line.unitPrice));
-        const unit = normalizeText(line.unit) || "kg";
-
-        await Ingredient.findOneAndUpdate(
-          withTenantFilter(req, { name: ingredientName }),
-          {
-            $setOnInsert: {
-              restaurantId,
-              name: ingredientName,
-              minStock: 0
-            },
-            $set: {
-              unit,
-              pricePerUnit: unitPrice,
-              purchasePrice: unitPrice
-            },
-            $inc: {
-              quantity,
-              currentStock: quantity
-            }
-          },
-          { upsert: true, new: true }
-        );
-      }
+      await purchaseOrder.save();
+      const result = await receivePurchaseOrder({
+        restaurantId,
+        purchaseOrderId: purchaseOrder._id,
+        receivedItems: purchaseOrder.lines,
+        createdBy: req.user?.userId || null
+      });
+      return res.json(result.purchaseOrder);
     }
 
     await purchaseOrder.save();

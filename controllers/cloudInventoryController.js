@@ -8,6 +8,14 @@ const Supplier = require("../models/Supplier");
 const PurchaseOrder = require("../models/PurchaseOrder");
 const Order = require("../models/Order");
 const { syncMenuAvailability } = require("../services/cloudKitchenOperationsService");
+const {
+  createInventoryMovement,
+  runInInventoryTransaction
+} = require("../services/inventoryMovementService");
+const {
+  producePrepItem,
+  receivePurchaseOrder
+} = require("../services/hybridInventoryService");
 const { assertCloudKitchenWorkspace } = require("../utils/cloudKitchenWorkspace");
 const {
   getTenantRestaurantId,
@@ -323,7 +331,39 @@ const createRawMaterial = async (req, res) => {
       minStockUnit: payload.minStockUnit
     });
 
-    const created = await RawMaterial.create({ restaurantId, ...payload });
+    const initialStock = payload.currentStock;
+    let created;
+    await runInInventoryTransaction(async (session) => {
+      const docs = await RawMaterial.create(
+        [
+          {
+            restaurantId,
+            ...payload,
+            quantity: 0,
+            currentStock: 0,
+            stock: 0
+          }
+        ],
+        { session }
+      );
+      created = docs[0];
+      if (initialStock > 0) {
+        const movementResult = await createInventoryMovement({
+          restaurantId,
+          itemId: created._id,
+          itemType: "raw_material",
+          movementType: "adjustment",
+          quantity: initialStock,
+          unit: payload.unit,
+          costPerUnit: payload.costPerUnit,
+          referenceType: "adjustment",
+          createdBy: req.user?.userId || null,
+          notes: "Initial stock",
+          session
+        });
+        created = movementResult.item;
+      }
+    });
     await syncMenuAvailability(restaurantId);
     emitInventoryUpdate(req, { scope: "raw", action: "created", itemId: created._id });
     return res.status(201).json(serializeRawMaterial(created));
@@ -357,11 +397,39 @@ const updateRawMaterial = async (req, res) => {
       minStockUnit: payload.minStockUnit
     });
 
-    const updated = await RawMaterial.findOneAndUpdate(
-      withTenantDocFilter(req, req.params.id, { stockCategory: "RAW_MATERIAL" }),
-      payload,
-      { new: true, runValidators: true }
-    );
+    let updated;
+    await runInInventoryTransaction(async (session) => {
+      const existing = await RawMaterial.findOne(
+        withTenantDocFilter(req, req.params.id, { stockCategory: "RAW_MATERIAL" })
+      ).session(session);
+      if (!existing) {
+        return;
+      }
+      const stockDelta = Number((toNumber(payload.currentStock) - toNumber(existing.quantity)).toFixed(4));
+      const stockFields = ["quantity", "currentStock", "stock"];
+      stockFields.forEach((field) => delete payload[field]);
+      Object.assign(existing, payload);
+      await existing.save({ session });
+      if (stockDelta) {
+        const movementResult = await createInventoryMovement({
+          restaurantId,
+          itemId: existing._id,
+          itemType: "raw_material",
+          movementType: "adjustment",
+          quantity: stockDelta,
+          unit: payload.unit,
+          costPerUnit: payload.costPerUnit,
+          referenceType: "adjustment",
+          createdBy: req.user?.userId || null,
+          notes: "Manual stock edit",
+          allowNegativeStock: true,
+          session
+        });
+        updated = movementResult.item;
+      } else {
+        updated = existing;
+      }
+    });
     if (!updated) {
       return res.status(404).json({ message: "Raw material not found" });
     }
@@ -439,15 +507,18 @@ const validateAndDeductRawUsage = async ({ req, restaurantId, rawMaterialUsage }
     const materialUnit = normalizeUnit(material.unit || line.unit || "kg") || "kg";
     const convertedQty = convertBetweenUnits(line.qty, line.unit, materialUnit);
     const deductionQty = Number.isFinite(convertedQty) ? convertedQty : line.qty;
-    material.quantity = Number((toNumber(material.quantity) - deductionQty).toFixed(4));
-    material.currentStock = material.quantity;
-    material.lowStockAlert = isBelowMinStock({
-      quantity: material.quantity,
-      unit: material.unit,
-      minStock: material.minStock,
-      minStockUnit: material.minStockUnit
+    await createInventoryMovement({
+      restaurantId,
+      itemId: material._id,
+      itemType: "raw_material",
+      movementType: "prep_consumption",
+      quantity: deductionQty,
+      unit: materialUnit,
+      costPerUnit: toNumber(material.costPerUnit ?? material.pricePerUnit),
+      referenceType: "prep_batch",
+      createdBy: req.user?.userId || null,
+      notes: "Prep raw material consumption"
     });
-    await material.save();
   }
 
   await syncMenuAvailability(restaurantId);
@@ -513,20 +584,14 @@ const createPrepItem = async (req, res) => {
     if (!payload.name) return res.status(400).json({ message: "Prep item name is required" });
     if (payload.quantity <= 0) return res.status(400).json({ message: "Quantity must be greater than zero" });
 
-    const usage = await validateAndDeductRawUsage({
-      req,
+    const result = await producePrepItem({
       restaurantId,
-      rawMaterialUsage: payload.rawMaterialUsage
-    });
-    const created = await PrepItem.create({
-      restaurantId,
-      ...payload,
-      rawMaterialUsage: usage,
+      payload,
       createdBy: req.user?.userId || null
     });
 
-    emitInventoryUpdate(req, { scope: "prep", action: "created", itemId: created._id });
-    return res.status(201).json(serializePrepItem(created));
+    emitInventoryUpdate(req, { scope: "prep", action: "created", itemId: result.prepItem._id });
+    return res.status(201).json(serializePrepItem(result.prepItem));
   } catch (err) {
     if (err?.code === 11000) {
       return res.status(409).json({ message: "Batch number already exists" });
@@ -538,13 +603,49 @@ const createPrepItem = async (req, res) => {
 
 const updatePrepItem = async (req, res) => {
   try {
-    await assertCloud(req);
+    const restaurantId = await assertCloud(req);
     const payload = normalizePrepPayload(req.body);
     if (!payload.name) return res.status(400).json({ message: "Prep item name is required" });
 
-    const updated = await PrepItem.findOneAndUpdate(withTenantDocFilter(req, req.params.id), payload, {
-      new: true,
-      runValidators: true
+    let updated;
+    await runInInventoryTransaction(async (session) => {
+      const existing = await PrepItem.findOne(withTenantDocFilter(req, req.params.id)).session(session);
+      if (!existing) {
+        return;
+      }
+
+      const stockDelta = Number((toNumber(payload.quantity) - toNumber(existing.quantity)).toFixed(4));
+      const nextCost = toNumber(payload.cost);
+      const nextCostPerUnit = payload.quantity > 0
+        ? nextCost / Math.max(1, toNumber(payload.quantity))
+        : undefined;
+      const stockFields = ["quantity", "cost"];
+      stockFields.forEach((field) => delete payload[field]);
+      Object.assign(existing, payload);
+      if (!stockDelta) {
+        existing.cost = nextCost;
+      }
+      await existing.save({ session });
+
+      if (stockDelta) {
+        const movementResult = await createInventoryMovement({
+          restaurantId,
+          itemId: existing._id,
+          itemType: "prep_item",
+          movementType: "adjustment",
+          quantity: stockDelta,
+          unit: existing.unit || payload.unit,
+          costPerUnit: nextCostPerUnit,
+          referenceType: "adjustment",
+          createdBy: req.user?.userId || null,
+          notes: "Prep stock edit",
+          allowNegativeStock: true,
+          session
+        });
+        updated = movementResult.item;
+      } else {
+        updated = existing;
+      }
     });
     if (!updated) return res.status(404).json({ message: "Prep item not found" });
 
@@ -623,7 +724,28 @@ const createPackagingItem = async (req, res) => {
       payload.supplierName = supplier?.name || payload.supplierName;
     }
 
-    const created = await Packaging.create({ restaurantId, ...payload });
+    const initialStock = payload.stock;
+    let created;
+    await runInInventoryTransaction(async (session) => {
+      const docs = await Packaging.create([{ restaurantId, ...payload, stock: 0 }], { session });
+      created = docs[0];
+      if (initialStock > 0) {
+        const movementResult = await createInventoryMovement({
+          restaurantId,
+          itemId: created._id,
+          itemType: "packaging",
+          movementType: "adjustment",
+          quantity: initialStock,
+          unit: payload.unit,
+          costPerUnit: payload.costPerUnit,
+          referenceType: "adjustment",
+          createdBy: req.user?.userId || null,
+          notes: "Initial stock",
+          session
+        });
+        created = movementResult.item;
+      }
+    });
     emitInventoryUpdate(req, { scope: "packaging", action: "created", itemId: created._id });
     return res.status(201).json(serializePackaging(created));
   } catch (err) {
@@ -646,9 +768,33 @@ const updatePackagingItem = async (req, res) => {
       payload.supplierName = supplier?.name || payload.supplierName;
     }
 
-    const updated = await Packaging.findOneAndUpdate(withTenantDocFilter(req, req.params.id), payload, {
-      new: true,
-      runValidators: true
+    let updated;
+    await runInInventoryTransaction(async (session) => {
+      const existing = await Packaging.findOne(withTenantDocFilter(req, req.params.id)).session(session);
+      if (!existing) return;
+      const stockDelta = Number((toNumber(payload.stock) - toNumber(existing.stock)).toFixed(4));
+      delete payload.stock;
+      Object.assign(existing, payload);
+      await existing.save({ session });
+      if (stockDelta) {
+        const movementResult = await createInventoryMovement({
+          restaurantId,
+          itemId: existing._id,
+          itemType: "packaging",
+          movementType: "adjustment",
+          quantity: stockDelta,
+          unit: payload.unit,
+          costPerUnit: payload.costPerUnit,
+          referenceType: "adjustment",
+          createdBy: req.user?.userId || null,
+          notes: "Manual stock edit",
+          allowNegativeStock: true,
+          session
+        });
+        updated = movementResult.item;
+      } else {
+        updated = existing;
+      }
     });
     if (!updated) return res.status(404).json({ message: "Packaging item not found" });
 
@@ -698,18 +844,23 @@ const deductWastageStock = async ({ req, item, type, quantity }) => {
     throw error;
   }
 
-  item[stockField] = Number((available - quantity).toFixed(4));
-  if (type === "raw") {
-    item.currentStock = item.quantity;
-    item.lowStockAlert = isBelowMinStock({
-      quantity: item.quantity,
-      unit: item.unit,
-      minStock: item.minStock,
-      minStockUnit: item.minStockUnit
-    });
-  }
-
-  await item.save();
+  await createInventoryMovement({
+    restaurantId: getTenantRestaurantId(req),
+    itemId: item._id,
+    itemType: type === "raw" ? "raw_material" : type === "prep" ? "prep_item" : "packaging",
+    movementType: "wastage",
+    quantity,
+    unit: item.unit || "unit",
+    costPerUnit:
+      type === "packaging"
+        ? toNumber(item.costPerUnit)
+        : type === "prep"
+          ? toNumber(item.cost) / Math.max(1, toNumber(item.quantity))
+          : toNumber(item.costPerUnit ?? item.pricePerUnit),
+    referenceType: "wastage",
+    createdBy: req.user?.userId || null,
+    notes: "Wastage deduction"
+  });
   if (type === "raw") {
     await syncMenuAvailability(getTenantRestaurantId(req));
   }
@@ -795,7 +946,7 @@ const createWastageEntry = async (req, res) => {
     if (quantity <= 0) return res.status(400).json({ message: "Quantity must be greater than zero" });
 
     const item = await findWastageItem(req, type, itemId);
-    await deductWastageStock({ req, item, type, quantity });
+    if (!item) return res.status(404).json({ message: "Wastage item not found" });
 
     const unitCost =
       type === "packaging"
@@ -804,18 +955,41 @@ const createWastageEntry = async (req, res) => {
           ? toNumber(item.cost) / Math.max(1, toNumber(item.quantity) + quantity)
           : toNumber(item.costPerUnit ?? item.pricePerUnit);
     const value = Number((quantity * unitCost).toFixed(2));
-    const created = await Wastage.create({
-      restaurantId,
-      ingredientId: type === "raw" ? item._id : null,
-      itemId: item._id,
-      type,
-      ingredientName: item.name,
-      quantity,
-      unit: item.unit || "kg",
-      reason,
-      estimatedCost: value,
-      value,
-      createdBy: req.user?.userId || null
+    let created;
+    await runInInventoryTransaction(async (session) => {
+      const docs = await Wastage.create(
+        [
+          {
+            restaurantId,
+            ingredientId: type === "raw" ? item._id : null,
+            itemId: item._id,
+            type,
+            ingredientName: item.name,
+            quantity,
+            unit: item.unit || "kg",
+            reason,
+            estimatedCost: value,
+            value,
+            createdBy: req.user?.userId || null
+          }
+        ],
+        { session }
+      );
+      created = docs[0];
+      await createInventoryMovement({
+        restaurantId,
+        itemId: item._id,
+        itemType: type === "raw" ? "raw_material" : type === "prep" ? "prep_item" : "packaging",
+        movementType: "wastage",
+        quantity,
+        unit: item.unit || "kg",
+        costPerUnit: unitCost,
+        referenceType: "wastage",
+        referenceId: created._id,
+        createdBy: req.user?.userId || null,
+        notes: reason,
+        session
+      });
     });
 
     emitInventoryUpdate(req, { scope: "wastage", action: "created", itemId: created._id });
@@ -1044,92 +1218,6 @@ const normalizePOPayload = async (req, body = {}, existing = null) => {
   };
 };
 
-const applyPurchaseOrderReceipt = async (req, purchaseOrder) => {
-  const restaurantId = getTenantRestaurantId(req);
-  const lines = normalizePOLines(purchaseOrder.items || purchaseOrder.lines);
-
-  for (const line of lines) {
-    if (line.type === "packaging") {
-      await Packaging.findOneAndUpdate(
-        line.itemId
-          ? { restaurantId, _id: line.itemId }
-          : { restaurantId, name: line.ingredientName },
-        {
-          $setOnInsert: {
-            restaurantId,
-            name: line.ingredientName,
-            minStock: 0
-          },
-          $set: {
-            unit: line.unit,
-            costPerUnit: line.unitPrice,
-            supplierId: purchaseOrder.supplierId || null,
-            supplierName: purchaseOrder.supplierName || ""
-          },
-          $inc: { stock: line.quantity }
-        },
-        { upsert: true, new: true }
-      );
-      continue;
-    }
-
-    if (line.type === "prep") {
-      await PrepItem.findOneAndUpdate(
-        line.itemId
-          ? { restaurantId, _id: line.itemId }
-          : { restaurantId, name: line.ingredientName, batchNo: `PO-${purchaseOrder.poNumber}` },
-        {
-          $setOnInsert: {
-            restaurantId,
-            name: line.ingredientName,
-            batchNo: `PO-${purchaseOrder.poNumber}`,
-            preparedAt: new Date()
-          },
-          $set: {
-            unit: line.unit,
-            cost: line.lineTotal
-          },
-          $inc: { quantity: line.quantity }
-        },
-        { upsert: true, new: true }
-      );
-      continue;
-    }
-
-    await RawMaterial.findOneAndUpdate(
-      line.itemId
-        ? { restaurantId, _id: line.itemId, stockCategory: "RAW_MATERIAL" }
-        : { restaurantId, name: line.ingredientName, stockCategory: "RAW_MATERIAL" },
-      {
-        $setOnInsert: {
-          restaurantId,
-          name: line.ingredientName,
-          minStock: 0,
-          stockCategory: "RAW_MATERIAL"
-        },
-        $set: {
-          unit: line.unit,
-          minStockUnit: line.unit,
-          costPerUnit: line.unitPrice,
-          pricePerUnit: line.unitPrice,
-          purchasePrice: line.unitPrice,
-          supplierId: purchaseOrder.supplierId || null,
-          supplier: purchaseOrder.supplierName || "",
-          vendorName: purchaseOrder.supplierName || ""
-        },
-        $inc: {
-          quantity: line.quantity,
-          currentStock: line.quantity,
-          stock: line.quantity
-        }
-      },
-      { upsert: true, new: true }
-    );
-  }
-
-  await syncMenuAvailability(restaurantId);
-};
-
 const createPurchaseOrder = async (req, res) => {
   try {
     const restaurantId = await assertCloud(req);
@@ -1141,11 +1229,6 @@ const createPurchaseOrder = async (req, res) => {
       ...payload,
       createdBy: req.user?.userId || null
     });
-    if (created.status === "DELIVERED") {
-      await applyPurchaseOrderReceipt(req, created);
-      created.receivedAt = created.receivedAt || new Date();
-      await created.save();
-    }
     emitInventoryUpdate(req, { scope: "purchase-orders", action: "created", itemId: created._id });
     return res.status(201).json(serializePurchaseOrder(created));
   } catch (err) {
@@ -1186,12 +1269,17 @@ const updatePurchaseOrderStatus = async (req, res) => {
       return res.status(400).json({ message: "Purchase order is closed" });
     }
 
-    purchaseOrder.status = nextStatus;
     if (nextStatus === "DELIVERED") {
-      await applyPurchaseOrderReceipt(req, purchaseOrder);
-      purchaseOrder.receivedAt = new Date();
+      await receivePurchaseOrder({
+        restaurantId: getTenantRestaurantId(req),
+        purchaseOrderId: purchaseOrder._id,
+        receivedItems: purchaseOrder.items || purchaseOrder.lines,
+        createdBy: req.user?.userId || null
+      });
+    } else {
+      purchaseOrder.status = nextStatus;
+      await purchaseOrder.save();
     }
-    await purchaseOrder.save();
     emitInventoryUpdate(req, {
       scope: "purchase-orders",
       action: nextStatus === "DELIVERED" ? "received" : "status-updated",

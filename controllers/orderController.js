@@ -546,7 +546,11 @@ const createOrder = async (req, res) => {
     return res.status(201).json(payload);
   } catch (error) {
     if (error.status) {
-      return res.status(error.status).json({ message: error.message });
+      return res.status(error.status).json({
+        message: error.message,
+        shortages: error.shortages || undefined,
+        canProceed: error.canProceed
+      });
     }
 
     return res.serverError(error);

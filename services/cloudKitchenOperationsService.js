@@ -8,6 +8,10 @@ const {
 } = require("../utils/accessControl");
 const { calculateIngredientDeduction, getQuantityPerPack } = require("../utils/recipeQuantities");
 const { isBelowMinStock } = require("../utils/unitConversion");
+const {
+  deductInventoryForOrder,
+  evaluateInventoryAvailability
+} = require("./hybridInventoryService");
 
 const DEFAULT_EXPECTED_PREP_TIME_MINUTES = 18;
 
@@ -284,88 +288,36 @@ const collectInventoryRequirements = async ({ restaurantId, orderItems = [] }) =
 };
 
 const assertInventoryAvailableForItems = async ({ restaurantId, orderItems = [] }) => {
-  const { requirements } = await collectInventoryRequirements({ restaurantId, orderItems });
-
-  requirements.forEach(({ ingredient, required }) => {
-    const available = toNumber(ingredient.quantity);
-    if (available < required) {
-      const error = new Error(
-        `Insufficient stock for ${ingredient.name}. Required ${required}, available ${available}.`
-      );
-      error.status = 409;
-      throw error;
-    }
-  });
-
-  return requirements;
+  const evaluation = await evaluateInventoryAvailability({ restaurantId, orderItems });
+  if (!evaluation.canProceed) {
+    const error = new Error("Insufficient stock for one or more ingredients");
+    error.status = 409;
+    error.shortages = evaluation.shortages;
+    error.canProceed = evaluation.canProceed;
+    throw error;
+  }
+  return evaluation.requirements;
 };
 
-const deductInventoryForItems = async ({ restaurantId, orderItems = [] }) => {
-  const { requirements, affectedMenuIds } = await collectInventoryRequirements({
+const deductInventoryForItems = async ({
+  restaurantId,
+  orderItems = [],
+  orderId = null,
+  createdBy = null,
+  overrideReason = "",
+  session = null
+}) => {
+  const result = await deductInventoryForOrder({
     restaurantId,
-    orderItems
+    orderItems,
+    orderId,
+    createdBy,
+    overrideReason,
+    session
   });
-
-  if (!requirements.length) {
-    await syncMenuAvailability(restaurantId, {
-      menuItemIds: affectedMenuIds
-    });
-
-    return {
-      deducted: [],
-      menuItems: []
-    };
-  }
-
-  requirements.forEach(({ ingredient, required }) => {
-    const available = toNumber(ingredient.quantity);
-    if (available < required) {
-      const error = new Error(
-        `Insufficient stock for ${ingredient.name}. Required ${required}, available ${available}.`
-      );
-      error.status = 409;
-      throw error;
-    }
-  });
-
-  await Ingredient.bulkWrite(
-    requirements.map(({ ingredient, required }) => ({
-      updateOne: {
-        filter: { _id: ingredient._id, restaurantId },
-        update: {
-          $inc: {
-            quantity: -required,
-            currentStock: -required,
-            stock: -required
-          },
-          $set: {
-            itemName: ingredient.name,
-            threshold: ingredient.minStock
-          }
-        }
-      }
-    })),
-    { ordered: false }
-  );
-
-  const updatedIngredients = await Ingredient.find({
-    restaurantId,
-    _id: { $in: requirements.map(({ ingredient }) => ingredient._id) }
-  });
-  await applyLowStockFlags(updatedIngredients);
-  const menuItems = await syncMenuAvailability(restaurantId, {
-    menuItemIds: affectedMenuIds
-  });
-
+  const menuItems = await syncMenuAvailability(restaurantId);
   return {
-    deducted: updatedIngredients.map((ingredient) => ({
-      itemId: ingredient._id,
-      itemName: ingredient.name,
-      stock: ingredient.quantity,
-      unit: ingredient.unit,
-      threshold: ingredient.minStock,
-      lowStockAlert: Boolean(ingredient.lowStockAlert)
-    })),
+    ...result,
     menuItems
   };
 };

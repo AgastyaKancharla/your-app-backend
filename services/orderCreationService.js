@@ -14,6 +14,11 @@ const {
   deductInventoryForItems,
   getExpectedPrepTimeMinutesForItems
 } = require("./cloudKitchenOperationsService");
+const { evaluateInventoryAvailability } = require("./hybridInventoryService");
+const {
+  createInventoryMovement,
+  runInInventoryTransaction
+} = require("./inventoryMovementService");
 const { BUSINESS_TYPES, normalizeBusinessType } = require("./workspaceAccess");
 
 const COMMISSION_RATE = {
@@ -187,8 +192,9 @@ const syncLowStockAlerts = async (restaurantId) => {
   await Ingredient.bulkWrite(operations, { ordered: false });
 };
 
-const applyInventoryDeductionForOrder = async (restaurantId, cleanItems) => {
-  for (const item of cleanItems) {
+const applyInventoryDeductionForOrder = async (restaurantId, cleanItems, orderId = null, createdBy = null) => {
+  await runInInventoryTransaction(async (session) => {
+    for (const item of cleanItems) {
     const recipe = await findRecipeForOrderItem(restaurantId, item);
 
     if (!recipe) {
@@ -206,17 +212,23 @@ const applyInventoryDeductionForOrder = async (restaurantId, cleanItems) => {
         continue;
       }
 
-      await Ingredient.findOneAndUpdate(
-        { restaurantId, _id: stockItem._id },
-        {
-          $inc: {
-            quantity: -deductionQty,
-            currentStock: -deductionQty
-          }
-        }
-      );
+      await createInventoryMovement({
+        restaurantId,
+        itemId: stockItem._id,
+        itemType: "raw_material",
+        movementType: "order_deduction",
+        quantity: deductionQty,
+        unit: stockItem.unit || ingredient.unit || "kg",
+        costPerUnit: toNumber(stockItem.costPerUnit ?? stockItem.pricePerUnit),
+        referenceType: "order",
+        referenceId: orderId,
+        createdBy,
+        notes: "Order deduction",
+        session
+      });
     }
   }
+  });
 
   await syncLowStockAlerts(restaurantId);
 };
@@ -595,11 +607,25 @@ const createOrderRecord = async ({
     throw error;
   }
 
-  if (isCloudKitchen) {
-    await assertInventoryAvailableForItems({
+  const inventoryEvaluation = isCloudKitchen
+    ? await evaluateInventoryAvailability({
       restaurantId,
-      orderItems: cleanItems
-    });
+      orderItems: cleanItems,
+      overrideReason: payload.inventoryOverrideReason || payload.overrideReason,
+      userId: createdBy
+    })
+    : null;
+
+  if (isCloudKitchen && !inventoryEvaluation.canProceed) {
+    const error = new Error(
+      inventoryEvaluation.requiresOverride
+        ? "Inventory override reason is required"
+        : "Insufficient stock for one or more ingredients"
+    );
+    error.status = inventoryEvaluation.requiresOverride ? 400 : 409;
+    error.shortages = inventoryEvaluation.shortages;
+    error.canProceed = inventoryEvaluation.requiresOverride ? true : inventoryEvaluation.canProceed;
+    throw error;
   }
 
   const subtotal = cleanItems.reduce((sum, item) => sum + item.quantity * item.price, 0);
@@ -678,7 +704,11 @@ const createOrderRecord = async ({
   const order = new Order({
     restaurantId,
     invoiceNumber,
-    items: cleanItems.map((item) => ({
+    items: cleanItems.map((item) => {
+      const snapshot = inventoryEvaluation?.itemSnapshots?.find(
+        (entry) => String(entry.menuItemId || "") === String(item.menuItemId || item.menuId || "")
+      );
+      return {
       menuItemId: item.menuItemId,
       menuId: item.menuId,
       name: item.name,
@@ -690,8 +720,16 @@ const createOrderRecord = async ({
       notes: item.notes,
       image: item.image,
       quantity: item.quantity,
-      price: item.price
-    })),
+      price: item.price,
+      recipeVersionId: snapshot?.recipeVersionId || null,
+      costSnapshot: snapshot?.costSnapshot || {
+        recipeCost: item.costPrice,
+        unitCost: item.costPrice,
+        totalCost: item.costPrice * item.quantity,
+        ingredients: []
+      }
+    };
+    }),
     subtotal,
     gstTotal,
     packagingCharge,
@@ -716,6 +754,7 @@ const createOrderRecord = async ({
     orderType,
     tableCode,
     platform,
+    inventoryOverride: inventoryEvaluation?.override || undefined,
     expectedPrepTimeMinutes,
     delivery,
     totalAmount: grossTotal,
@@ -744,10 +783,13 @@ const createOrderRecord = async ({
   if (isCloudKitchen) {
     await deductInventoryForItems({
       restaurantId,
-      orderItems: cleanItems
+      orderItems: cleanItems,
+      orderId: savedOrder._id,
+      createdBy,
+      overrideReason: payload.inventoryOverrideReason || payload.overrideReason || ""
     });
   } else {
-    await applyInventoryDeductionForOrder(restaurantId, cleanItems);
+    await applyInventoryDeductionForOrder(restaurantId, cleanItems, savedOrder._id, createdBy);
   }
 
   savedOrder = await upsertCustomerForOrder({

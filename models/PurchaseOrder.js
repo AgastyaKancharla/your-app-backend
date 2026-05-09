@@ -36,6 +36,11 @@ const PurchaseOrderLineSchema = new mongoose.Schema(
       default: 0,
       min: 0
     },
+    receivedQuantity: {
+      type: Number,
+      default: 0,
+      min: 0
+    },
     qty: {
       type: Number,
       default: 0,
@@ -159,7 +164,10 @@ PurchaseOrderSchema.pre("validate", function syncPurchaseOrderAliases(next) {
         unit: String(line.unit || "kg").trim() || "kg",
         unitPrice: Number.isFinite(unitPrice) ? Math.max(0, unitPrice) : 0,
         cost: Number.isFinite(unitPrice) ? Math.max(0, unitPrice) : 0,
-        lineTotal: Number.isFinite(lineTotal) ? Math.max(0, lineTotal) : 0
+        lineTotal: Number.isFinite(lineTotal) ? Math.max(0, lineTotal) : 0,
+        receivedQuantity: Number.isFinite(Number(line.receivedQuantity || 0))
+          ? Math.max(0, Number(line.receivedQuantity || 0))
+          : 0
       };
     })
     .filter((line) => line.ingredientName && line.quantity > 0);

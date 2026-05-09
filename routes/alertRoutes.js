@@ -1,6 +1,7 @@
 const express = require("express");
 
 const requirePermission = require("../middleware/requirePermission");
+const hybridInventoryController = require("../controllers/hybridInventoryController");
 const { getAlerts } = require("../services/cloudKitchenOperationsService");
 const { assertCloudKitchenWorkspace } = require("../utils/cloudKitchenWorkspace");
 
@@ -21,5 +22,13 @@ router.get("/", requirePermission("orders.view"), async (req, res) => {
     return res.serverError(err);
   }
 });
+
+router.get("/inventory", requirePermission("inventory.view"), hybridInventoryController.listAlerts);
+
+router.patch(
+  "/inventory/:id/acknowledge",
+  requirePermission("inventory.update"),
+  hybridInventoryController.acknowledgeAlert
+);
 
 module.exports = router;
