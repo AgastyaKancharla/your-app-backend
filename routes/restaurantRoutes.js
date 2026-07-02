@@ -61,36 +61,46 @@ router.post("/", requireAuth, async (req, res) => {
       inventory_deduction_enabled: false // always off at signup, enabled later once recipes exist
     };
 
-    // TEMP DIAGNOSTIC: confirm the JWT is actually reaching PostgREST by
-    // checking what auth.uid() resolves to for this real request.
-    const diagnosticCheck = await req.supabase.from("users").select("id").eq("id", req.userId).maybeSingle();
-    console.error("[POST /restaurants] diagnostic self-select:", JSON.stringify({
-      found: Boolean(diagnosticCheck.data),
-      error: diagnosticCheck.error,
-      expectedUserId: req.userId
-    }));
+    // NOTE: we deliberately do NOT chain .select() on this insert.
+    // restaurants_select_member's policy checks is_member_of(id), and
+    // that membership row is created by an AFTER INSERT trigger — so at
+    // the exact moment PostgREST would evaluate the SELECT policy to
+    // return the inserted row, the membership doesn't exist yet and the
+    // whole operation gets rejected with a misleading RLS error on the
+    // INSERT itself. Instead we insert, then re-fetch afterward once the
+    // trigger has run and membership genuinely exists.
+    const { error: insertError } = await req.supabase.from("restaurants").insert({
+      name,
+      city,
+      owner_id: req.userId,
+      business_type_label: businessTypeLabel,
+      ...businessFeatures
+    });
 
-    const { data: restaurant, error } = await req.supabase
+    if (insertError) {
+      return res.status(500).json({ message: "Unable to create restaurant workspace" });
+    }
+
+    // Re-fetch the restaurant we just created. By now the AFTER INSERT
+    // trigger has run, the membership row exists, and is_member_of(id)
+    // will correctly return true for this user.
+    const { data: restaurant, error: fetchError } = await req.supabase
       .from("restaurants")
-      .insert({
-        name,
-        city,
-        owner_id: req.userId,
-        business_type_label: businessTypeLabel,
-        ...businessFeatures
-      })
-      .select()
-      .single();
+      .select("*")
+      .eq("owner_id", req.userId)
+      .eq("name", name)
+      .order("created_at", { ascending: false })
+      .limit(1)
+      .maybeSingle();
 
-    if (error) {
-      console.error("[POST /restaurants] Supabase insert error:", JSON.stringify(error));
-      return res.status(500).json({ message: "Unable to create restaurant workspace", debug: error.message });
+    if (fetchError || !restaurant) {
+      return res.status(500).json({ message: "Restaurant created but could not be loaded" });
     }
 
     return res.status(201).json({ restaurant });
   } catch (err) {
     console.error("[POST /restaurants] Unexpected error:", err);
-    return res.status(500).json({ message: "Unable to create restaurant workspace", debug: err.message });
+    return res.status(500).json({ message: "Unable to create restaurant workspace" });
   }
 });
 
