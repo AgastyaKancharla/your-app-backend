@@ -74,12 +74,14 @@ router.post("/", requireAuth, async (req, res) => {
       .single();
 
     if (error) {
-      return res.status(500).json({ message: "Unable to create restaurant workspace" });
+      console.error("[POST /restaurants] Supabase insert error:", JSON.stringify(error));
+      return res.status(500).json({ message: "Unable to create restaurant workspace", debug: error.message });
     }
 
     return res.status(201).json({ restaurant });
   } catch (err) {
-    return res.status(500).json({ message: "Unable to create restaurant workspace" });
+    console.error("[POST /restaurants] Unexpected error:", err);
+    return res.status(500).json({ message: "Unable to create restaurant workspace", debug: err.message });
   }
 });
 
@@ -126,3 +128,4 @@ router.patch("/current/features", requireAuth, requireTenant, async (req, res) =
 });
 
 module.exports = router;
+
