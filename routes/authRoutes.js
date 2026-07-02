@@ -166,7 +166,7 @@ router.post("/logout", requireAuth, async (req, res) => {
  */
 router.get("/me", requireAuth, async (req, res) => {
   try {
-    const { data: profile, error: profileError } = await req.supabase
+    let { data: profile, error: profileError } = await req.supabase
       .from("users")
       .select("*")
       .eq("id", req.userId)
@@ -174,6 +174,35 @@ router.get("/me", requireAuth, async (req, res) => {
 
     if (profileError && profileError.code !== "PGRST116") {
       return res.status(500).json({ message: "Unable to load profile" });
+    }
+
+    // Self-heal: if signup happened while email confirmation was required
+    // (or any other reason the profile upsert didn't run at signup time),
+    // create the missing row now using metadata Supabase Auth already
+    // has on file. This guarantees /me never returns a user with no
+    // profile, regardless of the auth confirmation settings in effect
+    // at the time they originally signed up.
+    if (!profile) {
+      const { data: authUser } = await req.supabase.auth.getUser();
+      const metadata = authUser?.user?.user_metadata || {};
+
+      const { data: created, error: createError } = await req.supabase
+        .from("users")
+        .upsert(
+          {
+            id: req.userId,
+            name: metadata.name || "",
+            email: req.userEmail,
+            phone: metadata.phone || ""
+          },
+          { onConflict: "id" }
+        )
+        .select()
+        .single();
+
+      if (!createError) {
+        profile = created;
+      }
     }
 
     const { data: memberships, error: membershipError } = await req.supabase
@@ -198,4 +227,6 @@ router.get("/me", requireAuth, async (req, res) => {
   }
 });
 
+
 module.exports = router;
+
