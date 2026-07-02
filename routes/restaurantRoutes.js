@@ -61,6 +61,15 @@ router.post("/", requireAuth, async (req, res) => {
       inventory_deduction_enabled: false // always off at signup, enabled later once recipes exist
     };
 
+    // TEMP DIAGNOSTIC: confirm the JWT is actually reaching PostgREST by
+    // checking what auth.uid() resolves to for this real request.
+    const diagnosticCheck = await req.supabase.from("users").select("id").eq("id", req.userId).maybeSingle();
+    console.error("[POST /restaurants] diagnostic self-select:", JSON.stringify({
+      found: Boolean(diagnosticCheck.data),
+      error: diagnosticCheck.error,
+      expectedUserId: req.userId
+    }));
+
     const { data: restaurant, error } = await req.supabase
       .from("restaurants")
       .insert({
